@@ -71,6 +71,10 @@ WINDOW_ALPHA = 1.0        # 0.85 - 1.0 (โปร่งใส)
 ALWAYS_ON_TOP = True
 CODE_FONT = ('Consolas', 10)
 UI_FONT = ('Segoe UI', 9)
+STATUS_FONT = ('Segoe UI', 10)
+HOVER_DEBOUNCE_MS = 30    # หน่วงพรีวิวตอนชี้ปุ่ม กัน UI รีเฟรชรัวเวลาลากเมาส์ผ่านหลายปุ่ม
+STATUS_LINES = 2          # ความสูงคงที่ของบรรทัดสถานะ (บรรทัด) — ข้อความยาวกว่านี้จะถูกตัด ไม่ดันแท็บลง
+TARGET_LABEL_CHARS = 32   # ความกว้างคงที่ของป้าย "เป้าหมาย: ..." (ตัวอักษร) กันหน้าต่างยืด/หดตามชื่อหน้าต่าง IDE
 
 EXIT_HOTKEY = 'ctrl+shift+q'
 
@@ -506,14 +510,18 @@ def key_up(vk):
 
 
 def tap(vk, *mods):
-    for m in mods:
-        key_down(m)
-        time.sleep(KEY_GAP / 2)
-    key_down(vk)
-    key_up(vk)
-    for m in reversed(mods):
-        time.sleep(KEY_GAP / 2)
-        key_up(m)
+    pressed = []
+    try:
+        for m in mods:
+            key_down(m)
+            pressed.append(m)
+            time.sleep(KEY_GAP / 2)
+        key_down(vk)
+        key_up(vk)
+    finally:   # ปล่อย modifier เสมอ แม้เกิด exception กลางทาง (กัน Ctrl ค้าง)
+        for m in reversed(pressed):
+            time.sleep(KEY_GAP / 2)
+            key_up(m)
     time.sleep(KEY_GAP)
 
 
@@ -573,14 +581,18 @@ def focus_window(hwnd):
     fg = user32.GetForegroundWindow()
     cur = kernel32.GetCurrentThreadId()
     fg_thread = user32.GetWindowThreadProcessId(fg, None) if fg else 0
-    if fg_thread and fg_thread != cur:
-        user32.AttachThreadInput(cur, fg_thread, True)
-    user32.BringWindowToTop(hwnd)
-    user32.SetForegroundWindow(hwnd)
-    if fg_thread and fg_thread != cur:
-        user32.AttachThreadInput(cur, fg_thread, False)
-    time.sleep(0.05)
-    return user32.GetForegroundWindow() == hwnd
+    attached = bool(fg_thread and fg_thread != cur and user32.AttachThreadInput(cur, fg_thread, True))
+    try:
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+    finally:   # ถอด input thread เสมอ ไม่งั้นคีย์บอร์ด/เมาส์ของ 2 thread จะผูกกันค้าง
+        if attached:
+            user32.AttachThreadInput(cur, fg_thread, False)
+    for _ in range(25):
+        if user32.GetForegroundWindow() == hwnd:
+            return True
+        time.sleep(0.01)
+    return False
 
 
 # ---- Clipboard: ใช้ pyperclip ถ้ามี ไม่มีก็ใช้ Win32 API ตรง ----
@@ -698,6 +710,13 @@ class Typer(threading.Thread):
                 self.status('สลับไปหน้าต่าง IDE ไม่ได้ — คลิกที่ IDE แล้วใช้คีย์ลัดแทน', ok=False)
                 return
             time.sleep(FOCUS_DELAY)
+            # ยืนยันอีกครั้งก่อนกดคีย์: ถ้า Focus เด้งกลับมาหน้าต่างโพย (เช่น Windows บล็อก/คลิกค้าง)
+            # ลองสลับอีกรอบ — ถ้ายังไม่ได้ ห้ามกด Ctrl+V/Enter เด็ดขาด (ไม่งั้นจะไปลงช่อง speed/cm ของเราเอง)
+            if user32.GetForegroundWindow() != target:
+                if not focus_window(target):
+                    self.status('สลับไปหน้าต่าง IDE ไม่ทัน — กดปุ่มอีกครั้ง', ok=False)
+                    return
+                time.sleep(FOCUS_DELAY)
 
         if opts['end']:
             tap(VK_END)
@@ -783,6 +802,7 @@ class HotkeyThread(threading.Thread):
 # ============================================================================
 def build_app(start_hotkeys=True):
     import tkinter as tk
+    import tkinter.font as tkfont
     from tkinter import ttk
 
     class App:
@@ -823,6 +843,7 @@ def build_app(start_hotkeys=True):
             self.v_preview = tk.StringVar(value='')
             self.v_target = tk.StringVar(value='เป้าหมาย: -')
             self.v_actinfo = tk.StringVar(value='')
+            self._hover_job = None      # after() id ของพรีวิวตอนชี้ปุ่ม (debounce)
 
             self._build_ui()
             self.v_act.trace_add('write', lambda *a: self._on_act_change())
@@ -867,7 +888,9 @@ def build_app(start_hotkeys=True):
                       activebackground='#115e59', activeforeground='white', relief='flat', bd=0,
                       font=('Segoe UI', 9, 'bold'), padx=8, cursor='hand2', takefocus=0,
                       command=lambda: self.run_cmd('cmd:ctrl+alt+o', from_button=True)).pack(side='left', padx=(6, 0))
-            ttk.Label(top, textvariable=self.v_target, foreground='#555').pack(side='left', padx=6)
+            # width คงที่: ชื่อหน้าต่าง IDE ยาว/สั้นไม่ทำให้หน้าต่างโพยยืด-หด (ซึ่งทำให้แท็บจัดวางใหม่)
+            ttk.Label(top, textvariable=self.v_target, foreground='#555',
+                      width=TARGET_LABEL_CHARS).pack(side='left', padx=6)
             ttk.Checkbutton(top, text='ย่อ', variable=self.v_compact, command=self._toggle_compact,
                             takefocus=0).pack(side='right')
             ttk.Checkbutton(top, text='บนสุด', variable=self.v_top, takefocus=0,
@@ -924,13 +947,23 @@ def build_app(start_hotkeys=True):
             # ---- Action Pad (ปุ่มใหญ่ครบ 22 ตัว + None) ----
             self._build_action_pad(outer)
 
-            # ---- พรีวิว + สถานะ ----
-            self.lbl_preview = ttk.Label(outer, textvariable=self.v_preview, style='Preview.TLabel',
-                                         foreground='#6b46c1', wraplength=470, justify='left')
-            self.lbl_preview.pack(fill='x')
-            self.lbl_status = ttk.Label(outer, textvariable=self.v_status, style='Status.TLabel',
-                                        foreground='#1f7a3a', wraplength=380, justify='left')
-            self.lbl_status.pack(fill='x', pady=(0, 4))
+            # ---- พรีวิว + สถานะ: กรอบความสูงคงที่ (Zero Layout Shift) ----
+            # เดิม label ตัดบรรทัดด้วย wraplength -> ข้อความตอนชี้ปุ่ม (1 บรรทัด) กับตอนออก (2 บรรทัด)
+            # สูงไม่เท่ากัน แท็บด้านล่างจึงเด้งขึ้น-ลงหนีเมาส์ เกิด <Leave>/<Enter> วนไม่จบ และคลิกหลุด
+            # ตอนนี้: กรอบ pack_propagate(False) สูงตายตัว + พรีวิวบรรทัดเดียว (ไม่ wrap)
+            code_line = tkfont.Font(root, font=CODE_FONT).metrics('linespace')
+            status_line = tkfont.Font(root, font=STATUS_FONT).metrics('linespace')
+            self.info_box = ttk.Frame(outer, height=code_line + 2 + status_line * STATUS_LINES + 6)
+            self.info_box.pack(fill='x', pady=(0, 4))
+            self.info_box.pack_propagate(False)
+            self.lbl_preview = ttk.Label(self.info_box, textvariable=self.v_preview, style='Preview.TLabel',
+                                         foreground='#6b46c1', anchor='w')
+            self.lbl_preview.pack(side='top', fill='x')
+            self.lbl_status = ttk.Label(self.info_box, textvariable=self.v_status, style='Status.TLabel',
+                                        foreground='#1f7a3a', justify='left', anchor='nw')
+            self.lbl_status.pack(side='top', fill='both', expand=True)
+            # wraplength ตามความกว้างจริงของกรอบ (ไม่กระทบความสูง เพราะกรอบล็อกไว้แล้ว)
+            self.info_box.bind('<Configure>', self._fit_status_wrap)
 
             # ---- แท็บปุ่มคำสั่ง (เป็นโพยคีย์ลัดไปในตัว) ----
             self.nb = ttk.Notebook(outer)
@@ -980,8 +1013,9 @@ def build_app(start_hotkeys=True):
                     b = ttk.Button(frame, style='Code.TButton', takefocus=0, width=-16,
                                    command=lambda cid=c.id: self.run_cmd(cid, from_button=True))
                     b.grid(row=row, column=col, padx=1, pady=1, sticky='ew')
-                    b.bind('<Enter>', lambda e, cid=c.id: self._show_preview(cid))
-                    b.bind('<Leave>', lambda e: self._live_preview())
+                    # add='+' และไม่คืน 'break' -> ไม่แตะ class binding ของปุ่ม (คลิกทำงานปกติ)
+                    b.bind('<Enter>', lambda e, cid=c.id: self._schedule_hover(cid), add='+')
+                    b.bind('<Leave>', lambda e: self._schedule_hover(None), add='+')
                     self.cmd_buttons.append((b, c))
                     col += 1
                     if col == 4:
@@ -1026,8 +1060,9 @@ def build_app(start_hotkeys=True):
                 grid.columnconfigure(c, weight=1, uniform='tile')
 
             # คำอธิบายเต็มของตัวที่เลือก (ff/bb เทียบ Gyro)
+            # height=2 (บรรทัด) คงที่: เปลี่ยนตัวอักษร/None แล้วกล่องไม่สูง-เตี้ยลง
             self.lbl_actdesc = tk.Label(box, textvariable=self.v_actinfo, font=('Segoe UI', 9), anchor='w',
-                                        justify='left', wraplength=460, padx=6, pady=3)
+                                        justify='left', wraplength=self._px(460), padx=6, pady=3, height=2)
             self.lbl_actdesc.pack(fill='x', pady=(4, 0))
 
         def _make_tile(self, parent, ch):
@@ -1069,7 +1104,7 @@ def build_app(start_hotkeys=True):
                 if self.v_compact.get():
                     w.pack_forget()
                 else:
-                    w.pack(fill='both', expand=True, after=self.lbl_status)
+                    w.pack(fill='both', expand=True, after=self.info_box)
 
         def _update_actinfo(self):
             ch = self.v_act.get()
@@ -1097,9 +1132,9 @@ def build_app(start_hotkeys=True):
             """บรรทัดตัวอย่างสด: ff + ffcmg (เทียบโหมดเส้น/Gyro) + คำสั่งล่าสุด"""
             p, errors = self.read_params()
             if errors:
-                self.v_preview.set('⚠ ' + ', '.join(errors))
+                self._set_preview('⚠ ' + ', '.join(errors))
                 return
-            ids = ['cmd:ctrl+alt+1', 'cmd:ctrl+alt+;']    # ff (เส้น) + ffdircl (ลำดับ act/dir/tol)
+            ids =['cmd:ctrl+alt+1', 'cmd:ctrl+alt+;']    # ff (เส้น) + ffdircl (ลำดับ act/dir/tol)
             if self.last_cmd_id and self.last_cmd_id not in ids:
                 ids.append(self.last_cmd_id)
             parts = []
@@ -1108,7 +1143,41 @@ def build_app(start_hotkeys=True):
                     parts.append(render(self.cmds[cid], p, self.opts()))
                 except ValueError:
                     parts.append(f'{self.cmds[cid].label(self.v_alias.get())}(✗ ต้องมี action)')
-            self.v_preview.set('ตัวอย่าง →  ' + '   '.join(parts))
+            self._set_preview('ตัวอย่าง →  ' + '   '.join(parts))
+
+        # ------------------------------------------------------ พรีวิวตอนชี้ปุ่ม (debounce + ไม่ set ซ้ำ)
+        def _px(self, px96):
+            """แปลงพิกเซลที่ออกแบบไว้ที่ 96 DPI -> พิกเซลจริงตามสเกลจอ (125% / 150%)"""
+            try:
+                return int(px96 * self.root.winfo_fpixels('1i') / 96.0)
+            except tk.TclError:
+                return px96
+
+        def _set_preview(self, text):
+            if self.v_preview.get() != text:     # ข้อความเหมือนเดิมเป๊ะ -> ไม่สั่งวาดซ้ำ
+                self.v_preview.set(text)
+
+        def _schedule_hover(self, cid):
+            """<Enter> (cid) / <Leave> (None): รวบเหตุการณ์ที่เกิดติดกันภายใน HOVER_DEBOUNCE_MS ให้เหลือครั้งเดียว
+            เช่นเลื่อนจากปุ่ม A ไป B: Leave(A) + Enter(B) -> แสดงพรีวิว B ทีเดียว ไม่กระพริบกลับไปตัวอย่างรวม"""
+            if self._hover_job is not None:
+                try:
+                    self.root.after_cancel(self._hover_job)
+                except tk.TclError:
+                    pass
+            self._hover_job = self.root.after(HOVER_DEBOUNCE_MS, self._apply_hover, cid)
+
+        def _apply_hover(self, cid):
+            self._hover_job = None
+            if cid is None:
+                self._live_preview()
+            else:
+                self._show_preview(cid)
+
+        def _fit_status_wrap(self, event):
+            wrap = max(event.width - 8, 100)
+            if int(str(self.lbl_status.cget('wraplength') or 0)) != wrap:
+                self.lbl_status.configure(wraplength=wrap)
 
         # ------------------------------------------------------ ค่า/ตรวจสอบ
         def read_params(self):
@@ -1155,12 +1224,12 @@ def build_app(start_hotkeys=True):
         def _show_preview(self, cid):
             p, errors = self.read_params()
             if errors:
-                self.v_preview.set('⚠ ' + ', '.join(errors))
+                self._set_preview('⚠ ' + ', '.join(errors))
                 return
             try:
-                self.v_preview.set('→ ' + render(self.cmds[cid], p, self.opts()))
+                self._set_preview('→ ' + render(self.cmds[cid], p, self.opts()))
             except ValueError as exc:
-                self.v_preview.set('⚠ ' + str(exc))
+                self._set_preview('⚠ ' + str(exc))
 
         def set_status(self, msg, ok=True):
             self.v_status.set(msg)
@@ -1470,9 +1539,12 @@ def main():
         print('โปรแกรมนี้รองรับเฉพาะ Windows')
         sys.exit(1)
     try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)   # ตัวหนังสือคมบนจอ 125-150%
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)   # ตัวหนังสือคมบนจอ 125-150% (ต้องเรียกก่อนสร้าง Tk)
     except Exception:
-        pass
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()     # Windows 7/8 ที่ไม่มี shcore
+        except Exception:
+            pass
 
     if '--gui-test' in sys.argv:
         app = build_app(start_hotkeys=False)
